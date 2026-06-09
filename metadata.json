@@ -1,0 +1,6 @@
+{
+  "name": "G.Lab",
+  "description": "An elegant, futuristic digital laboratory where ideas evolve into products, tools, worlds, and interactive experiences.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
