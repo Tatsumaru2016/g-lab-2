@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { motion } from 'motion/react';
+import { motion, useMotionValue } from 'motion/react';
 import { Clock } from 'lucide-react';
 
 import EntryChamber from './components/chambers/EntryChamber';
@@ -20,14 +20,12 @@ import {
   chamberToAngle,
   angleToChamber,
   sceneRotateOffset,
+  sceneLayerOpacity,
+  sceneSlotAngle,
+  shouldRenderSceneLayer,
+  SCENE_COUNT,
 } from './nav';
-import {
-  applyDetentResistance,
-  clampAngle,
-  crossedDetentBoundary,
-  isCoastSettled,
-  stepCoast,
-} from './jogDialPhysics';
+import { clampAngle } from './jogDialPhysics';
 import {
   isWheelCoastSettled,
   nextDetentTarget,
@@ -35,213 +33,226 @@ import {
   WHEEL_NOTCH_THRESHOLD,
   wheelImpulseToward,
 } from './scrollPhysics';
+import { isSceneFollowSettled, stepSceneFollow } from './sceneFollowPhysics';
 import { playGearEngage, playGearLock } from './mechanicalSound';
 
 export default function App() {
   const [currentChamberId, setCurrentChamberId] = useState(1);
   const [scrollAngle, setScrollAngle] = useState(0);
+  const scrollAngleMv = useMotionValue(0);
   const [currentTime, setCurrentTime] = useState('');
   const [isCollapsing, setIsCollapsing] = useState(false);
   const [explosionActive, setExplosionActive] = useState(false);
-  const [isScrollPhysicsActive, setIsScrollPhysicsActive] = useState(false);
-  const [isDialPhysicsActive, setIsDialPhysicsActive] = useState(false);
+  const [isDialWheelActive, setIsDialWheelActive] = useState(false);
+  const [isSceneFollowActive, setIsSceneFollowActive] = useState(false);
+  const [dialDisplayAngle, setDialDisplayAngle] = useState(0);
+  const dialDisplayMv = useMotionValue(0);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chamberIdRef = useRef(1);
+  const dialAngleRef = useRef(0);
+  const dialLeadAngleRef = useRef(0);
+  const dialWheelVelocity = useRef(0);
+  const dialWheelTargetRef = useRef(0);
   const scrollAngleRef = useRef(0);
-  const scrollVelocity = useRef(0);
-  const scrollTargetRef = useRef(0);
-  const scrollRafRef = useRef<number | null>(null);
-  const dialRafRef = useRef<number | null>(null);
-  const isNavBusyRef = useRef(false);
+  const sceneFollowVelocity = useRef(0);
+  const dialWheelRafRef = useRef<number | null>(null);
+  const sceneFollowRafRef = useRef<number | null>(null);
+  const sceneFollowLastFrame = useRef(0);
+  const isDialWheelBusyRef = useRef(false);
   const wheelAccumulatorRef = useRef(0);
   const gearEngagePlayed = useRef(false);
-  const dialGearEngagePlayed = useRef(false);
-  const lastTickChamberRef = useRef(1);
-  const dialBaseAngle = useRef(0);
-  const dialPrevAngle = useRef(0);
-  const dialVelocity = useRef(0);
-  const dialLastFrame = useRef(0);
 
-  const liveChamberId = useMemo(() => angleToChamber(scrollAngle), [scrollAngle]);
+  const sceneAnchoredChamber = useMemo(() => angleToChamber(scrollAngle), [scrollAngle]);
+  const dialLiveChamber = useMemo(() => angleToChamber(dialDisplayAngle), [dialDisplayAngle]);
   const sceneDrift = useMemo(
-    () => sceneRotateOffset(scrollAngle, currentChamberId),
-    [scrollAngle, currentChamberId],
+    () => sceneRotateOffset(scrollAngle, sceneAnchoredChamber),
+    [scrollAngle, sceneAnchoredChamber],
   );
-  const isNavInMotion = isScrollPhysicsActive || isDialPhysicsActive;
-  const isSceneMotionActive = isNavInMotion || Math.abs(sceneDrift) > 0.05;
-  const displayChamberId = isSceneMotionActive ? liveChamberId : currentChamberId;
+  const forcedPreviewId =
+    dialLiveChamber !== sceneAnchoredChamber ? dialLiveChamber : undefined;
+
+  const isNavInMotion = isDialWheelActive || isSceneFollowActive;
+  const isSceneMotionActive =
+    isNavInMotion || Math.abs(sceneDrift) > 0.05 || dialLiveChamber !== sceneAnchoredChamber;
 
   useEffect(() => {
-    isNavBusyRef.current = isNavInMotion;
-  }, [isNavInMotion]);
-  const sceneRotation = useMemo(
-    () => sceneRotateOffset(scrollAngle, displayChamberId),
-    [scrollAngle, displayChamberId],
+    isDialWheelBusyRef.current = isDialWheelActive;
+  }, [isDialWheelActive]);
+
+  const sceneRing = useMemo(
+    () =>
+      Array.from({ length: SCENE_COUNT }, (_, i) => {
+        const id = i + 1;
+        return {
+          id,
+          visible: shouldRenderSceneLayer(
+            scrollAngle,
+            id,
+            sceneAnchoredChamber,
+            isSceneMotionActive,
+            forcedPreviewId,
+          ),
+          opacity: sceneLayerOpacity(
+            scrollAngle,
+            id,
+            sceneAnchoredChamber,
+            isSceneMotionActive,
+            forcedPreviewId,
+          ),
+          slotAngle: sceneSlotAngle(id),
+        };
+      }),
+    [scrollAngle, sceneAnchoredChamber, isSceneMotionActive, forcedPreviewId],
   );
 
-  const stopScrollRaf = useCallback(() => {
-    if (scrollRafRef.current !== null) {
-      cancelAnimationFrame(scrollRafRef.current);
-      scrollRafRef.current = null;
+  const stopDialWheel = useCallback(() => {
+    if (dialWheelRafRef.current !== null) {
+      cancelAnimationFrame(dialWheelRafRef.current);
+      dialWheelRafRef.current = null;
     }
-  }, []);
-
-  const stopDialCoast = useCallback(() => {
-    if (dialRafRef.current !== null) {
-      cancelAnimationFrame(dialRafRef.current);
-      dialRafRef.current = null;
-    }
-    setIsDialPhysicsActive(false);
-    dialGearEngagePlayed.current = false;
-  }, []);
-
-  const stopScrollCoast = useCallback(() => {
-    stopScrollRaf();
     wheelAccumulatorRef.current = 0;
-    setIsScrollPhysicsActive(false);
-  }, [stopScrollRaf]);
+    setIsDialWheelActive(false);
+  }, []);
+
+  const stopSceneFollow = useCallback(() => {
+    if (sceneFollowRafRef.current !== null) {
+      cancelAnimationFrame(sceneFollowRafRef.current);
+      sceneFollowRafRef.current = null;
+    }
+    setIsSceneFollowActive(false);
+  }, []);
+
+  const applySceneAngle = useCallback(
+    (angle: number) => {
+      const clamped = clampAngle(angle);
+      scrollAngleRef.current = clamped;
+      scrollAngleMv.set(clamped);
+      setScrollAngle(clamped);
+    },
+    [scrollAngleMv],
+  );
+
+  const applyDialLead = useCallback(
+    (angle: number) => {
+      const clamped = clampAngle(angle);
+      dialAngleRef.current = clamped;
+      dialLeadAngleRef.current = clamped;
+      dialDisplayMv.set(clamped);
+      setDialDisplayAngle(clamped);
+    },
+    [dialDisplayMv],
+  );
+
+  const tickSceneFollow = useCallback(
+    (now: number) => {
+      const dt = Math.min(now - sceneFollowLastFrame.current, 40);
+      sceneFollowLastFrame.current = now;
+      const target = dialLeadAngleRef.current;
+      const state = stepSceneFollow(
+        { angle: scrollAngleRef.current, velocity: sceneFollowVelocity.current },
+        target,
+        dt,
+      );
+
+      if (isSceneFollowSettled(state, target)) {
+        applySceneAngle(target);
+        sceneFollowVelocity.current = 0;
+        sceneFollowRafRef.current = null;
+        setIsSceneFollowActive(false);
+        return;
+      }
+
+      sceneFollowVelocity.current = state.velocity;
+      applySceneAngle(state.angle);
+      sceneFollowRafRef.current = requestAnimationFrame(tickSceneFollow);
+    },
+    [applySceneAngle],
+  );
+
+  const ensureSceneFollow = useCallback(() => {
+    if (Math.abs(scrollAngleRef.current - dialLeadAngleRef.current) < 0.35) {
+      applySceneAngle(dialLeadAngleRef.current);
+      return;
+    }
+    if (sceneFollowRafRef.current !== null) return;
+    setIsSceneFollowActive(true);
+    sceneFollowLastFrame.current = performance.now();
+    sceneFollowRafRef.current = requestAnimationFrame(tickSceneFollow);
+  }, [applySceneAngle, tickSceneFollow]);
 
   const stopAllNav = useCallback(() => {
-    stopScrollCoast();
-    stopDialCoast();
-  }, [stopScrollCoast, stopDialCoast]);
+    stopDialWheel();
+    stopSceneFollow();
+  }, [stopDialWheel, stopSceneFollow]);
 
-  const applyAngle = useCallback((angle: number, prevAngle: number, playTickOnCross: boolean) => {
-    const clamped = clampAngle(angle);
-    scrollAngleRef.current = clamped;
-    setScrollAngle(clamped);
-
-    if (playTickOnCross && crossedDetentBoundary(prevAngle, clamped)) {
-      const tickId = angleToChamber(clamped);
-      if (tickId !== lastTickChamberRef.current) {
-        lastTickChamberRef.current = tickId;
-      }
-    }
-  }, []);
-
-  const settleScroll = useCallback(() => {
-    const id = angleToChamber(scrollTargetRef.current);
+  const settleDialWheel = useCallback(() => {
+    const id = angleToChamber(dialWheelTargetRef.current);
     const snapped = chamberToAngle(id);
-    scrollTargetRef.current = snapped;
-    scrollAngleRef.current = snapped;
-    scrollVelocity.current = 0;
+    dialWheelTargetRef.current = snapped;
+    applyDialLead(snapped);
+    dialWheelVelocity.current = 0;
     chamberIdRef.current = id;
-    lastTickChamberRef.current = id;
-    stopScrollRaf();
-    setScrollAngle(snapped);
     setCurrentChamberId(id);
-    setIsScrollPhysicsActive(false);
+    stopDialWheel();
     playGearLock();
-  }, [stopScrollRaf]);
+    ensureSceneFollow();
+  }, [applyDialLead, ensureSceneFollow, stopDialWheel]);
 
-  const settleDial = useCallback(() => {
-    const id = angleToChamber(scrollAngleRef.current);
-    const snapped = chamberToAngle(id);
-    scrollTargetRef.current = snapped;
-    scrollAngleRef.current = snapped;
-    chamberIdRef.current = id;
-    lastTickChamberRef.current = id;
-    stopDialCoast();
-    setScrollAngle(snapped);
-    setCurrentChamberId(id);
-    playGearLock();
-  }, [stopDialCoast]);
-
-  const startDialCoast = useCallback(
-    (fromVelocity: number) => {
-      stopDialCoast();
-      setIsDialPhysicsActive(true);
-      let state = { angle: scrollAngleRef.current, velocity: fromVelocity };
-      dialGearEngagePlayed.current = false;
-
-      const tick = () => {
-        const prev = scrollAngleRef.current;
-        state = stepCoast(state);
-        applyAngle(state.angle, prev, true);
-
-        const target = chamberToAngle(angleToChamber(state.angle));
-        const nearDetent = Math.abs(target - state.angle) < 8 && Math.abs(state.velocity) < 0.5;
-        if (nearDetent && !dialGearEngagePlayed.current) {
-          dialGearEngagePlayed.current = true;
-          playGearEngage();
-        }
-
-        if (isCoastSettled(state)) {
-          dialRafRef.current = null;
-          settleDial();
-          return;
-        }
-
-        dialRafRef.current = requestAnimationFrame(tick);
-      };
-
-      dialRafRef.current = requestAnimationFrame(tick);
+  const handleChamberChange = useCallback(
+    (id: number) => {
+      const snapped = chamberToAngle(id);
+      stopDialWheel();
+      chamberIdRef.current = id;
+      setCurrentChamberId(id);
+      applyDialLead(snapped);
+      ensureSceneFollow();
     },
-    [applyAngle, settleDial, stopDialCoast],
+    [applyDialLead, ensureSceneFollow, stopDialWheel],
   );
 
-  const handleDialDragStart = useCallback(() => {
-    stopAllNav();
-    setIsDialPhysicsActive(true);
-    dialBaseAngle.current = scrollAngleRef.current;
-    dialPrevAngle.current = scrollAngleRef.current;
-    dialVelocity.current = 0;
-    dialLastFrame.current = performance.now();
-    dialGearEngagePlayed.current = false;
-  }, [stopAllNav]);
-
-  const handleDialDragMove = useCallback(
-    (pointerDelta: number, frameTime: number) => {
-      const resisted = applyDetentResistance(dialBaseAngle.current, pointerDelta);
-      const next = clampAngle(dialBaseAngle.current + resisted);
-      const dt = frameTime - dialLastFrame.current;
-
-      if (dt > 0) {
-        dialVelocity.current = ((next - dialPrevAngle.current) / dt) * 16.67;
-      }
-
-      applyAngle(next, dialPrevAngle.current, true);
-      dialPrevAngle.current = next;
-      dialLastFrame.current = frameTime;
+  const handleDialAngleChange = useCallback(
+    (angle: number) => {
+      const clamped = clampAngle(angle);
+      dialLeadAngleRef.current = clamped;
+      setDialDisplayAngle(clamped);
+      ensureSceneFollow();
     },
-    [applyAngle],
+    [ensureSceneFollow],
   );
 
-  const handleDialDragEnd = useCallback(() => {
-    startDialCoast(dialVelocity.current);
-  }, [startDialCoast]);
+  const handleDialInteractionStart = useCallback(() => {
+    stopDialWheel();
+  }, [stopDialWheel]);
 
   const startWheelStep = useCallback(
     (direction: 1 | -1) => {
       if (isCollapsing) return;
 
-      stopDialCoast();
-
-      const home = chamberToAngle(chamberIdRef.current);
-      if (Math.abs(scrollAngleRef.current - home) > 0.5) {
-        scrollAngleRef.current = home;
-        setScrollAngle(home);
-      }
-
-      const angle = scrollAngleRef.current;
+      const angle = dialAngleRef.current;
       const target = nextDetentTarget(chamberIdRef.current, direction);
       if (Math.abs(target - angle) < 0.5) return;
 
-      stopScrollRaf();
-      scrollTargetRef.current = target;
-      scrollVelocity.current = wheelImpulseToward(angle, target);
-      setIsScrollPhysicsActive(true);
+      stopDialWheel();
+      dialWheelTargetRef.current = target;
+      dialWheelVelocity.current = wheelImpulseToward(angle, target);
+      setIsDialWheelActive(true);
       gearEngagePlayed.current = false;
+      let lastWheelFrame = performance.now();
 
-      const tick = () => {
-        const prev = scrollAngleRef.current;
-        const state = stepWheelCoast({
-          angle: scrollAngleRef.current,
-          velocity: scrollVelocity.current,
-          target: scrollTargetRef.current,
-        });
-        scrollVelocity.current = state.velocity;
-        applyAngle(state.angle, prev, true);
+      const tick = (now: number) => {
+        const dt = Math.min(now - lastWheelFrame, 40);
+        lastWheelFrame = now;
+        const state = stepWheelCoast(
+          {
+            angle: dialAngleRef.current,
+            velocity: dialWheelVelocity.current,
+            target: dialWheelTargetRef.current,
+          },
+          dt,
+        );
+        dialWheelVelocity.current = state.velocity;
+        applyDialLead(state.angle);
+        ensureSceneFollow();
 
         if (state.engaging && !gearEngagePlayed.current) {
           gearEngagePlayed.current = true;
@@ -249,17 +260,17 @@ export default function App() {
         }
 
         if (isWheelCoastSettled(state)) {
-          scrollRafRef.current = null;
-          settleScroll();
+          dialWheelRafRef.current = null;
+          settleDialWheel();
           return;
         }
 
-        scrollRafRef.current = requestAnimationFrame(tick);
+        dialWheelRafRef.current = requestAnimationFrame(tick);
       };
 
-      scrollRafRef.current = requestAnimationFrame(tick);
+      dialWheelRafRef.current = requestAnimationFrame(tick);
     },
-    [applyAngle, isCollapsing, settleScroll, stopDialCoast, stopScrollRaf],
+    [applyDialLead, ensureSceneFollow, isCollapsing, settleDialWheel, stopDialWheel],
   );
 
   useEffect(() => {
@@ -280,7 +291,7 @@ export default function App() {
 
     const handleWheelNative = (e: WheelEvent) => {
       e.preventDefault();
-      if (isCollapsing || isNavBusyRef.current) return;
+      if (isCollapsing || isDialWheelBusyRef.current) return;
 
       wheelAccumulatorRef.current += e.deltaY;
       if (Math.abs(wheelAccumulatorRef.current) < WHEEL_NOTCH_THRESHOLD) return;
@@ -296,7 +307,7 @@ export default function App() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (isCollapsing || isNavBusyRef.current) return;
+      if (isCollapsing || isDialWheelBusyRef.current) return;
       if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === 'PageDown') {
         if (chamberIdRef.current < 9) startWheelStep(1);
       } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'PageUp') {
@@ -312,7 +323,7 @@ export default function App() {
     touchStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
   };
   const handleTouchEnd = (e: React.TouchEvent) => {
-    if (isCollapsing || isNavBusyRef.current) return;
+    if (isCollapsing || isDialWheelBusyRef.current) return;
     const dx = touchStart.current.x - e.changedTouches[0].clientX;
     const dy = touchStart.current.y - e.changedTouches[0].clientY;
     const arcDelta = Math.abs(dx) >= Math.abs(dy) ? dx : dy;
@@ -331,7 +342,12 @@ export default function App() {
       lastTickChamberRef.current = 1;
       setCurrentChamberId(1);
       scrollAngleRef.current = 0;
+      scrollAngleMv.set(0);
       setScrollAngle(0);
+      dialDisplayMv.set(0);
+      setDialDisplayAngle(0);
+      dialAngleRef.current = 0;
+      dialLeadAngleRef.current = 0;
       setIsCollapsing(false);
       setExplosionActive(false);
     }, 3200);
@@ -375,7 +391,7 @@ export default function App() {
           </div>
 
           <div className="hidden lg:flex items-center gap-6 font-mono text-[9px] text-[#111111]/45 uppercase">
-            <span>[ ACTIVE FLOOR: L-0{liveChamberId} ]</span>
+            <span>[ ACTIVE FLOOR: L-0{dialLiveChamber} ]</span>
             <span>SYSTEM_ONLINE // DEPLOY_SSL</span>
           </div>
         </div>
@@ -405,22 +421,34 @@ export default function App() {
           className="absolute inset-0"
           style={{ clipPath: `inset(0 0 0 ${SCENE_CLIP_LEFT}px)` }}
         >
-          <div
+          <motion.div
             className="absolute inset-0 w-full h-full"
             style={{
               transformOrigin: SCENE_PIVOT_ORIGIN,
-              transform: `rotate(${sceneRotation}deg)`,
+              rotate: scrollAngleMv,
               willChange: isNavInMotion ? 'transform' : 'auto',
             }}
           >
-            <div
-              key={displayChamberId}
-              className="w-full h-full"
-              style={{ paddingLeft: SCENE_CLIP_LEFT }}
-            >
-              {renderChamber(displayChamberId)}
-            </div>
-          </div>
+            {sceneRing.map(({ id, visible, opacity, slotAngle }) =>
+              visible ? (
+                <motion.div
+                  key={id}
+                  className="absolute inset-0 w-full h-full"
+                  style={{
+                    transformOrigin: SCENE_PIVOT_ORIGIN,
+                    rotate: slotAngle,
+                    opacity,
+                    pointerEvents: opacity < 0.5 ? 'none' : 'auto',
+                    backfaceVisibility: 'hidden',
+                  }}
+                >
+                  <div className="w-full h-full" style={{ paddingLeft: SCENE_CLIP_LEFT }}>
+                    {renderChamber(id)}
+                  </div>
+                </motion.div>
+              ) : null,
+            )}
+          </motion.div>
         </div>
       </main>
 
@@ -480,12 +508,12 @@ export default function App() {
 
       <JogDial
         settledChamberId={currentChamberId}
-        previewChamberId={liveChamberId}
-        syncedAngle={scrollAngle}
-        isNavInMotion={isNavInMotion}
-        onDialDragStart={handleDialDragStart}
-        onDialDragMove={handleDialDragMove}
-        onDialDragEnd={handleDialDragEnd}
+        previewChamberId={dialLiveChamber}
+        syncedAngle={dialDisplayAngle}
+        isWheelDriving={isDialWheelActive}
+        onChamberChange={handleChamberChange}
+        onAngleChange={handleDialAngleChange}
+        onInteractionStart={handleDialInteractionStart}
         isCollapsing={isCollapsing}
       />
     </div>

@@ -49,16 +49,17 @@ export interface CoastState {
 }
 
 /** One physics frame after pointer release — inertia + friction + detent spring. */
-export function stepCoast(state: CoastState): CoastState {
+export function stepCoast(state: CoastState, dtMs = 16.67): CoastState {
   let { angle, velocity } = state;
+  const step = Math.min(Math.max(dtMs / 16.67, 0.5), 2.5);
 
-  velocity *= JOG_FRICTION;
-  angle = clampAngle(angle + velocity);
+  velocity *= Math.pow(JOG_FRICTION, step);
+  angle = clampAngle(angle + velocity * step);
 
   const target = snapToDetent(angle);
-  const pull = (target - angle) * JOG_SETTLE_SPRING;
+  const pull = (target - angle) * JOG_SETTLE_SPRING * step;
   angle = clampAngle(angle + pull);
-  velocity = velocity * 0.88 + pull * 0.15;
+  velocity = velocity * Math.pow(0.88, step) + pull * 0.14;
 
   return { angle, velocity };
 }

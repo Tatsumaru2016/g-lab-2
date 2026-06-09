@@ -1,23 +1,33 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
+import { motion } from 'motion/react';
 import { CHAMBERS } from '../types';
 import {
   SCENE_ARC_DEGREES,
   DIAL_SIZE,
   DIAL_CENTER_OFFSET,
   DIAL_VISIBLE_WIDTH,
+  SCENE_SNAP_SPRING,
   SCENE_SNAP_EASE_CSS,
+  chamberToAngle,
+  angleToChamber,
 } from '../nav';
-import { crossedDetentBoundary } from '../jogDialPhysics';
-import { playDetentTick } from '../mechanicalSound';
+import {
+  applyDetentResistance,
+  clampAngle,
+  crossedDetentBoundary,
+  isCoastSettled,
+  stepCoast,
+} from '../jogDialPhysics';
+import { playDetentTick, playGearEngage, playGearLock } from '../mechanicalSound';
 
 interface JogDialProps {
   settledChamberId: number;
   previewChamberId: number;
   syncedAngle: number;
-  isNavInMotion: boolean;
-  onDialDragStart: () => void;
-  onDialDragMove: (pointerDelta: number, frameTime: number) => void;
-  onDialDragEnd: () => void;
+  isWheelDriving: boolean;
+  onChamberChange: (id: number) => void;
+  onAngleChange?: (angle: number) => void;
+  onInteractionStart?: () => void;
   isCollapsing: boolean;
 }
 
@@ -82,21 +92,35 @@ export default function JogDial({
   settledChamberId,
   previewChamberId,
   syncedAngle,
-  isNavInMotion,
-  onDialDragStart,
-  onDialDragMove,
-  onDialDragEnd,
+  isWheelDriving,
+  onChamberChange,
+  onAngleChange,
+  onInteractionStart,
   isCollapsing,
 }: JogDialProps) {
   const dialRef = useRef<HTMLDivElement | null>(null);
-  const prevSyncedAngle = useRef(syncedAngle);
   const startPointerAngle = useRef(0);
+  const baseAngle = useRef(0);
+  const prevAngle = useRef(0);
+  const velocity = useRef(0);
+  const lastFrame = useRef(0);
+  const coastRafRef = useRef<number | null>(null);
+  const gearEngagePlayed = useRef(false);
 
   const [isDragging, setIsDragging] = useState(false);
+  const [isCoasting, setIsCoasting] = useState(false);
+  const [dialAngle, setDialAngle] = useState(syncedAngle);
   const [clickPulse, setClickPulse] = useState(false);
 
-  const displayChamberId =
-    isNavInMotion || isDragging ? previewChamberId : settledChamberId;
+  const isPhysicsActive = isDragging || isCoasting;
+  const displayRotation = isPhysicsActive ? dialAngle : syncedAngle;
+  const instantRotate = isPhysicsActive || isWheelDriving;
+
+  const displayChamberId = isPhysicsActive
+    ? angleToChamber(dialAngle)
+    : isWheelDriving
+      ? previewChamberId
+      : settledChamberId;
 
   const triggerDetentClick = useCallback(() => {
     setClickPulse(true);
@@ -107,12 +131,71 @@ export default function JogDial({
     }
   }, []);
 
-  useEffect(() => {
-    if (crossedDetentBoundary(prevSyncedAngle.current, syncedAngle)) {
-      triggerDetentClick();
+  const maybeTickDetent = useCallback(
+    (next: number, prev: number) => {
+      if (crossedDetentBoundary(prev, next)) {
+        triggerDetentClick();
+      }
+    },
+    [triggerDetentClick],
+  );
+
+  const stopCoast = useCallback(() => {
+    if (coastRafRef.current !== null) {
+      cancelAnimationFrame(coastRafRef.current);
+      coastRafRef.current = null;
     }
-    prevSyncedAngle.current = syncedAngle;
-  }, [syncedAngle, triggerDetentClick]);
+    setIsCoasting(false);
+    gearEngagePlayed.current = false;
+  }, []);
+
+  useEffect(() => {
+    if (!isDragging && !isCoasting && !isWheelDriving) {
+      setDialAngle(syncedAngle);
+    }
+  }, [syncedAngle, isDragging, isCoasting, isWheelDriving]);
+
+  useEffect(() => () => stopCoast(), [stopCoast]);
+
+  const startCoast = useCallback(
+    (fromVelocity: number) => {
+      stopCoast();
+      setIsCoasting(true);
+      let state = { angle: prevAngle.current, velocity: fromVelocity };
+      let last = state.angle;
+      lastFrame.current = performance.now();
+
+      const tick = (now: number) => {
+        const dt = Math.min(now - lastFrame.current, 40);
+        lastFrame.current = now;
+        state = stepCoast(state, dt);
+        setDialAngle(state.angle);
+        onAngleChange?.(state.angle);
+        maybeTickDetent(state.angle, last);
+        last = state.angle;
+
+        const target = chamberToAngle(angleToChamber(state.angle));
+        const nearDetent = Math.abs(target - state.angle) < 8 && Math.abs(state.velocity) < 0.5;
+        if (nearDetent && !gearEngagePlayed.current) {
+          gearEngagePlayed.current = true;
+          playGearEngage();
+        }
+
+        if (isCoastSettled(state)) {
+          coastRafRef.current = null;
+          setIsCoasting(false);
+          onChamberChange(angleToChamber(state.angle));
+          playGearLock();
+          return;
+        }
+
+        coastRafRef.current = requestAnimationFrame(tick);
+      };
+
+      coastRafRef.current = requestAnimationFrame(tick);
+    },
+    [maybeTickDetent, onAngleChange, onChamberChange, stopCoast],
+  );
 
   const getPointerAngle = (clientX: number, clientY: number) => {
     if (!dialRef.current) return 0;
@@ -128,8 +211,14 @@ export default function JogDial({
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
+    onInteractionStart?.();
+    stopCoast();
     setIsDragging(true);
-    onDialDragStart();
+    baseAngle.current = isPhysicsActive ? dialAngle : syncedAngle;
+    prevAngle.current = baseAngle.current;
+    velocity.current = 0;
+    lastFrame.current = performance.now();
+    gearEngagePlayed.current = false;
     startPointerAngle.current = getPointerAngle(e.clientX, e.clientY);
     dialRef.current?.setPointerCapture(e.pointerId);
   };
@@ -137,13 +226,26 @@ export default function JogDial({
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!isDragging) return;
     const pointerDelta = getPointerAngle(e.clientX, e.clientY) - startPointerAngle.current;
-    onDialDragMove(pointerDelta, performance.now());
+    const frameTime = performance.now();
+    const resisted = applyDetentResistance(baseAngle.current, pointerDelta);
+    const next = clampAngle(baseAngle.current + resisted);
+    const dt = frameTime - lastFrame.current;
+
+    if (dt > 0) {
+      velocity.current = ((next - prevAngle.current) / dt) * 16.67;
+    }
+
+    setDialAngle(next);
+    onAngleChange?.(next);
+    maybeTickDetent(next, prevAngle.current);
+    prevAngle.current = next;
+    lastFrame.current = frameTime;
   };
 
   const handlePointerUp = () => {
     if (!isDragging) return;
     setIsDragging(false);
-    onDialDragEnd();
+    startCoast(velocity.current);
   };
 
   const rimTicks = [];
@@ -303,15 +405,16 @@ export default function JogDial({
           </text>
         </svg>
 
-        <div
+        <motion.div
           ref={dialRef}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           className="absolute inset-0 rounded-full cursor-grab active:cursor-grabbing"
+          animate={{ rotate: displayRotation }}
+          transition={instantRotate ? { duration: 0 } : SCENE_SNAP_SPRING}
           style={{
-            transform: `rotate(${syncedAngle}deg)`,
-            willChange: isNavInMotion ? 'transform' : 'auto',
+            willChange: isPhysicsActive ? 'transform' : 'auto',
           }}
         >
           <svg
@@ -467,7 +570,7 @@ export default function JogDial({
               );
             })}
           </svg>
-        </div>
+        </motion.div>
       </div>
     </div>
   );
